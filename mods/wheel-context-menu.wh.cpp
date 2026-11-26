@@ -305,6 +305,7 @@ struct Config {
     bool preferLeft = false;
     float edgeKeep = 0.5f;       // share of the radius kept on screen at the
                                  // top and bottom edges
+    float slideEdgeKeep = 0.75f; // the same for the sliding list's run of rows
 
     // Rearranging: press a label and hold, or press and pull.
     float holdSec = 0.30f;
@@ -421,6 +422,7 @@ struct Wheel {
     POINT center = {};       // screen px
     bool tiltArmed = false;  // tilt waits until the cursor is in the band
     RECT mon = {};           // the monitor the menu opened on
+    RECT work = {};          // and the part of it clear of the taskbar
     double extTop = 0.0;     // straight shapes: how far the menu reaches
     double extBottom = 0.0;  // above and below the centre line, px
     float scale = 1.0f;
@@ -2089,14 +2091,15 @@ static void UpdateExtent() {
 
 // Regular list: choose the row on the centre line so that `keep` (the row
 // the keyboard and scroll wheel are on) is on the screen, and the whole list
-// is too whenever it fits.
+// is too whenever it fits. "The screen" is the work area, so the list is
+// never tucked behind the taskbar.
 static void FitListView(Level& lvl, double keep, int rows) {
     const double rowH = RowHeight();
     const double margin = 8.0 * g.scale + rowH * 0.5;
     const double above = std::max(
-        0.0, std::floor((double(g.center.y - g.mon.top) - margin) / rowH));
+        0.0, std::floor((double(g.center.y - g.work.top) - margin) / rowH));
     const double below = std::max(
-        0.0, std::floor((double(g.mon.bottom - g.center.y) - margin) / rowH));
+        0.0, std::floor((double(g.work.bottom - g.center.y) - margin) / rowH));
     double w = lvl.viewWant;
     w = std::clamp(w, keep - below, keep + above);
     if (double(rows - 1) <= above + below)
@@ -2408,6 +2411,7 @@ static void OpenWheel(POINT pt) {
     const bool haveMonitor = GetMonitorInfoW(
         MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi) != 0;
     g.mon = haveMonitor ? mi.rcMonitor : RECT{};
+    g.work = haveMonitor ? mi.rcWork : RECT{};
     g.lastNote = LastNote();
     g.tiltArmed = false;  // Tick arms it once the cursor is in the band
     g.pressed = false;
@@ -2442,6 +2446,19 @@ static void OpenWheel(POINT pt) {
         // screen by choosing which row sits beside it.)
         if (!Straight() && top <= bottom)
             g.center.y = std::clamp(int(pt.y), top, bottom);
+
+        // The sliding list shows a fixed run of rows either side of its
+        // highlight line, so near the top or bottom it moves away from the
+        // edge until most of them are on screen. As with the wheel, the
+        // rows at the far end are the faded ones, and tilt waits for the
+        // cursor to reach the line.
+        if (cfg.shape == 2) {
+            const int run = int(90.0f / cfg.stepDeg * RowHeight() *
+                                cfg.slideEdgeKeep);
+            const int t = mi.rcWork.top + run;
+            const int b = mi.rcWork.bottom - run;
+            if (t <= b) g.center.y = std::clamp(int(pt.y), t, b);
+        }
     }
 
     g.rot = g.target = double(PreselectIndex(g.stack.back().items));
