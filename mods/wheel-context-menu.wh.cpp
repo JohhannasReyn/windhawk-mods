@@ -75,7 +75,7 @@ takes the menu, so use one at a time.
 - A menu whose top level has owner-drawn items with no readable text is
   shown as the standard menu instead. Inside a submenu such items show as
   "Item N".
-- Menu icons are not shown.
+- Icons that a program draws itself (owner-drawn) are not shown.
 - Stacked submenus can run past the screen edge when a menu is deep.
 */
 // ==/WindhawkModReadme==
@@ -134,7 +134,12 @@ takes the menu, so use one at a time.
   $description: Half-height of the centre band, in tenths of a degree.
 - itemSpacing: 12
   $name: Item spacing
-  $description: Degrees between items on the inner ring. In the sliding list, smaller values show more rows before they fade out.
+  $description: Degrees between items on the wheel's inner ring. In the list shapes it sets the row height in proportion, with 12 as the normal spacing.
+- textSize: 15
+  $name: Text size
+  $description: Size of the menu text, from 9 to 30. The rest of the menu scales with it.
+- icons: true
+  $name: Show menu icons
 - wrap: false
   $name: Wrap long lists
 - fadeOutAfter: 60
@@ -214,7 +219,9 @@ takes the menu, so use one at a time.
 #include <cstdint>
 #include <cwchar>
 #include <cwctype>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -245,7 +252,9 @@ struct Config {
     float outlineWidth = 1.5f;
     float outlineShadow = 0.55f; // dark halo so the white line shows on white
     bool innerOutline = true;
-    float fontSize = 15.0f;
+    float fontSize = 15.0f;      // at text scale 1
+    float textScale = 1.0f;      // the Text size setting; scales the whole menu
+    bool icons = true;           // show the menu's own icons
     const wchar_t* fontName = L"Segoe UI";
 
     // Angular alpha profile of the wheel, clockwise from 12:00.
@@ -354,6 +363,12 @@ enum : int {
     ID_OPT_BASE = 1000,   // radio choices: base + setting * 32 + choice
 };
 
+// A menu item's icon, copied out of the menu: premultiplied BGRA, top-down.
+struct IconData {
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;
+};
+
 struct Item {
     std::wstring text;
     int id = 0;
@@ -370,6 +385,7 @@ struct Item {
     HMENU hSub = nullptr;     // its submenu, if any
     bool lazy = false;        // submenu not read yet (sub holds a stand-in)
     std::wstring command;     // for ID_CUSTOM
+    std::shared_ptr<const IconData> icon;  // shared by copies of the item
     std::vector<Item> sub;
 };
 
@@ -397,6 +413,7 @@ struct Level {
     std::vector<Item>* src = nullptr;  // where this level lives in the model
     std::wstring rootText;      // top-level entry this level hangs off
     int hoisted = 0;            // leading items that are recent choices
+    bool icons = false;         // some item has an icon: all get the column
     float innerPx = 0.0f;       // where this level's labels start
     float rimPx = 0.0f;         // its outline radius
     float step = 0.0f;          // degrees between its items
@@ -427,6 +444,7 @@ struct Wheel {
     double extBottom = 0.0;  // above and below the centre line, px
     float scale = 1.0f;
     int size = 0;            // drawing space is size x size px, cursor centred
+    float dpiScale = 1.0f;   // the monitor's scale; `scale` adds the text size
     int surfX0 = 0;          // the window shows columns surfX0..surfX0+surfW
     int surfW = 0;           // of it (all of it for the wheel)
     float outerPx = 0.0f;    // current rim radius, px (fits this level)
@@ -613,7 +631,19 @@ static bool RingVisible(size_t d) {
 static bool Straight() { return cfg.shape != 0; }
 
 // Height of a row in a straight menu.
-static float RowHeight() { return (cfg.pillHeight + 3.0f) * g.scale; }
+// Follows the Item spacing setting (12 is the default), but never so tight
+// that rows overlap.
+static float RowHeight() {
+    const float h = (cfg.pillHeight + 3.0f) * cfg.stepDeg / 12.0f;
+    return std::max(cfg.pillHeight + 1.0f, h) * g.scale;
+}
+
+// Width of the icon column, and of everything beside an item's text.
+static float IconCol(float s) { return 22 * s; }
+static float ExtraWidth(const Level& lvl, const Item& it, float s) {
+    return (it.sub.empty() ? 0 : 18 * s) + (it.radio ? 18 * s : 0) +
+           (lvl.icons ? IconCol(s) : 0);
+}
 
 // The list position sitting on the centre line of the active level.
 static double TopRef() {
@@ -655,7 +685,35 @@ static bool InsideWheel(POINT pt) {
 // Graphics resources
 // ---------------------------------------------------------------------------
 
+static std::unordered_map<const IconData*, ID2D1Bitmap*> g_iconBitmaps;
+
+static void ReleaseIconBitmaps() {
+    for (auto& entry : g_iconBitmaps)
+        if (entry.second) entry.second->Release();
+    g_iconBitmaps.clear();
+}
+
+// The Direct2D bitmap for an icon, made the first time it is drawn.
+static ID2D1Bitmap* IconBitmap(const IconData* icon) {
+    const auto found = g_iconBitmaps.find(icon);
+    if (found != g_iconBitmaps.end()) return found->second;
+    ID2D1Bitmap* bmp = nullptr;
+    D2D1_BITMAP_PROPERTIES bp = {};
+    bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bp.dpiX = bp.dpiY = 96.0f;
+    D2D1_SIZE_U sz;
+    sz.width = UINT32(icon->w);
+    sz.height = UINT32(icon->h);
+    if (FAILED(g.rt->CreateBitmap(sz, icon->px.data(), UINT32(icon->w) * 4,
+                                  &bp, &bmp)))
+        bmp = nullptr;
+    g_iconBitmaps[icon] = bmp;  // a failure is remembered too
+    return bmp;
+}
+
 static void DiscardDeviceResources() {
+    ReleaseIconBitmaps();
     SafeRelease(g.bg);
     SafeRelease(g.brush);
     SafeRelease(g.rt);
@@ -863,13 +921,19 @@ static bool EnsureText() {
 
 static void MeasureLevel(Level& lvl) {
     const float s = g.scale;
-    if (lvl.widths.size() == lvl.items.size() && lvl.widthScale == s) return;
+    bool icons = false;
+    if (cfg.icons)
+        for (const Item& it : lvl.items)
+            if (it.icon) icons = true;
+    if (lvl.widths.size() == lvl.items.size() && lvl.widthScale == s &&
+        lvl.icons == icons)
+        return;
+    lvl.icons = icons;
     const float span = (cfg.textOuter - cfg.textInner) * s;
     lvl.widths.assign(lvl.items.size(), 0.0f);
     for (size_t i = 0; i < lvl.items.size(); i++) {
         const Item& it = lvl.items[i];
-        const float maxW = span - (it.sub.empty() ? 0 : 18 * s) -
-                           (it.radio ? 18 * s : 0);
+        const float maxW = span - ExtraWidth(lvl, it, s);
         float w = maxW;
         IDWriteTextLayout* layout = nullptr;
         if (SUCCEEDED(g.dw->CreateTextLayout(
@@ -917,9 +981,8 @@ static void LayoutLevel() {
             longest = 0.0f;
             for (size_t i = 0; i < lvl.items.size(); i++)
                 longest = std::max(
-                    longest, lvl.widths[i] +
-                                 (lvl.items[i].sub.empty() ? 0 : 18 * s) +
-                                 (lvl.items[i].radio ? 18 * s : 0));
+                    longest,
+                    lvl.widths[i] + ExtraWidth(lvl, lvl.items[i], s));
         }
         const float cap = inner + (cfg.outerRadius - cfg.textInner) * s;
         lvl.rimPx = std::min(
@@ -1199,7 +1262,10 @@ static void Render() {
             setT(m);
             const bool hasSub = !it.sub.empty();
             const float w = widths[size_t(idx)];
-            const float chk = it.radio ? chev : 0;  // check-mark column
+            // In order from the hub: icon, check mark, text, submenu arrow.
+            const float ico = lvl.icons ? IconCol(s) : 0;
+            const float chk = it.radio ? chev : 0;
+            const float lead = ico + chk;
 
             // The sliding list keeps the wheel's fading outline, as a
             // straight edge on each side of the rows.
@@ -1225,7 +1291,7 @@ static void Render() {
                               ? SpanRect(c, colL + 4 * s, colR - 4 * s,
                                          rowH * 0.5f - 1 * s)
                               : SpanRect(c, r0 - pad,
-                                         r0 + chk + w + (hasSub ? chev : 0) +
+                                         r0 + lead + w + (hasSub ? chev : 0) +
                                              pad,
                                          pillHalf);
                 rr.radiusX = rr.radiusY = 5 * s;
@@ -1241,20 +1307,30 @@ static void Render() {
                 Color(selected ? cfg.selTextColor : cfg.textColor);
             g.brush->SetColor(&col);
             g.brush->SetOpacity(a * (it.disabled ? 0.4f : 1.0f));
+            if (ico > 0 && it.icon) {
+                if (ID2D1Bitmap* bmp = IconBitmap(it.icon.get())) {
+                    const D2D1_RECT_F ir =
+                        SpanRect(c, r0 + 1 * s, r0 + 17 * s, 8 * s);
+                    g.rt->DrawBitmap(bmp, &ir, a * (it.disabled ? 0.4f : 1.0f),
+                                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                     nullptr);
+                }
+            }
             if (it.checked) {
-                const D2D1_RECT_F kr = SpanRect(c, r0, r0 + chk, halfH);
+                const D2D1_RECT_F kr =
+                    SpanRect(c, r0 + ico, r0 + ico + chk, halfH);
                 g.rt->DrawText(L"\x2713", 1, labelFmt, &kr, g.brush,
                                D2D1_DRAW_TEXT_OPTIONS_NONE,
                                DWRITE_MEASURING_MODE_NATURAL);
             }
             const D2D1_RECT_F tr =
-                SpanRect(c, r0 + chk, r1 - (hasSub ? chev : 0), halfH);
+                SpanRect(c, r0 + lead, r1 - (hasSub ? chev : 0), halfH);
             g.rt->DrawText(it.text.c_str(), UINT32(it.text.size()), labelFmt,
                            &tr, g.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP,
                            DWRITE_MEASURING_MODE_NATURAL);
             if (hasSub) {
                 const D2D1_RECT_F cr =
-                    SpanRect(c, r0 + chk + w, r0 + chk + w + chev, halfH);
+                    SpanRect(c, r0 + lead + w, r0 + lead + w + chev, halfH);
                 g.rt->DrawText(chevGlyph, 1, chevFmt, &cr, g.brush,
                                D2D1_DRAW_TEXT_OPTIONS_NONE,
                                DWRITE_MEASURING_MODE_NATURAL);
@@ -1776,6 +1852,15 @@ static const std::vector<Setting>& Settings() {
          [](float x) { cfg.lastNote = int(x); },
          {{L"Off", 0}, {L"Top of the list", 1}, {L"Bottom of the list", 2},
           {L"Centre", 3}}},
+        {L"Text size", L"opt_Textsize",
+         [] { return cfg.textScale * 15.0f; },
+         [](float x) { cfg.textScale = x / 15.0f; },
+         {{L"Small", 13}, {L"Normal", 15}, {L"Large", 18},
+          {L"Extra large", 22}}},
+        {L"Icons", L"opt_Icons",
+         [] { return cfg.icons ? 1.0f : 0.0f; },
+         [](float x) { cfg.icons = x > 0.5f; },
+         {{L"On", 1}, {L"Off", 0}}},
     };
     return v;
 }
@@ -1833,6 +1918,7 @@ static void ApplyOption(int id) {
     const size_t c = size_t((id - ID_OPT_BASE) % 32);
     if (k >= all.size() || c >= all[k].choices.size()) return;
     all[k].set(all[k].choices[c].value);
+    g.scale = g.dpiScale * cfg.textScale;  // a new text size shows at once
     if (IsSetting(all[k], L"opt_Openstoward"))
         g.side = cfg.preferLeft ? -1 : 1;  // show a side change now
     g.forceRender = true;
@@ -1859,7 +1945,9 @@ static void ApplyOption(int id) {
         LayoutLevel();
     }
     // Only a new shape or submenu mode moves the lists.
-    if (IsSetting(all[k], L"opt_Shape") || IsSetting(all[k], L"opt_Submenus"))
+    if (IsSetting(all[k], L"opt_Shape") ||
+        IsSetting(all[k], L"opt_Submenus") ||
+        IsSetting(all[k], L"opt_Textsize"))
         ResetListViews();
     // Remember it; see LoadConfig for how this meets the mod's settings.
     Wh_SetIntValue(all[k].key,
@@ -1914,6 +2002,55 @@ static bool IsHidden(const std::wstring& text) {
     return false;
 }
 
+// Copies an item's bitmap out of the menu. Menus that draw their icon
+// themselves (HBMMENU_CALLBACK) and the system glyphs have no bitmap to copy.
+static std::shared_ptr<const IconData> ReadIcon(HBITMAP hbmp) {
+    const INT_PTR v = INT_PTR(hbmp);
+    if (v >= -1 && v <= 11) return nullptr;  // null or an HBMMENU_* constant
+    BITMAP bm = {};
+    if (!GetObjectW(hbmp, sizeof(bm), &bm) || bm.bmWidth <= 0 ||
+        bm.bmHeight <= 0 || bm.bmWidth > 256 || bm.bmHeight > 256)
+        return nullptr;
+    auto data = std::make_shared<IconData>();
+    data->w = bm.bmWidth;
+    data->h = bm.bmHeight;
+    data->px.resize(size_t(data->w) * size_t(data->h));
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = data->w;
+    bi.bmiHeader.biHeight = -data->h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = GetDC(nullptr);
+    const int got = GetDIBits(dc, hbmp, 0, UINT(data->h), data->px.data(), &bi,
+                              DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    if (got != data->h) return nullptr;
+
+    // Icons with transparency are premultiplied ARGB. One with no alpha at
+    // all is an old-style opaque bitmap.
+    bool anyAlpha = false;
+    for (uint32_t p : data->px)
+        if (p >> 24) {
+            anyAlpha = true;
+            break;
+        }
+    for (uint32_t& p : data->px) {
+        if (!anyAlpha) {
+            p |= 0xFF000000u;
+            continue;
+        }
+        // Keep every channel within its alpha, as premultiplied needs.
+        const uint32_t a = p >> 24;
+        const uint32_t r = std::min((p >> 16) & 0xFF, a);
+        const uint32_t gr = std::min((p >> 8) & 0xFF, a);
+        const uint32_t b = std::min(p & 0xFF, a);
+        p = (a << 24) | (r << 16) | (gr << 8) | b;
+    }
+    return data;
+}
+
 // Set by ReadMenu when an item had no readable text.
 static bool g_sawUnreadable = false;
 
@@ -1930,7 +2067,7 @@ static std::vector<Item> ReadMenu(HMENU hMenu) {
         MENUITEMINFOW mii = {};
         mii.cbSize = sizeof(mii);
         mii.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU |
-                    MIIM_STRING;
+                    MIIM_STRING | MIIM_BITMAP;
         mii.dwTypeData = buf;
         mii.cch = 511;
         if (!GetMenuItemInfoW(hMenu, UINT(pos), TRUE, &mii)) continue;
@@ -1950,6 +2087,7 @@ static std::vector<Item> ReadMenu(HMENU hMenu) {
         if (IsHidden(it.text)) continue;
         it.id = ID_REAL;
         it.cmd = mii.wID;
+        it.icon = ReadIcon(mii.hbmpItem);
         it.hOwner = hMenu;
         it.pos = UINT(pos);
         it.disabled = (mii.fState & (MFS_DISABLED | MFS_GRAYED)) != 0;
@@ -2132,8 +2270,7 @@ static int HitTestLabel(POINT pt) {
                 cfg.pillHeight * sc * 0.5 + 2.0 * sc)
                 return -1;
             hi = lvl.innerPx + lvl.widths[size_t(k)] +
-                 (it.sub.empty() ? 0.0 : 18.0 * sc) +
-                 (it.radio ? 18.0 * sc : 0.0) + pad;
+                 ExtraWidth(lvl, it, float(sc)) + pad;
         }
         return (dx >= lo && dx <= hi) ? int(k) : -1;
     }
@@ -2146,9 +2283,7 @@ static int HitTestLabel(POINT pt) {
         std::fabs(q - double(k)) * TopStep() * kPi / 180.0 * r;
     if (lateral > cfg.pillHeight * s * 0.5 + 2.0 * s) return -1;
     const Item& it = lvl.items[size_t(k)];
-    const double w = lvl.widths[size_t(k)] +
-                     (it.sub.empty() ? 0.0 : 18.0 * s) +
-                     (it.radio ? 18.0 * s : 0.0);
+    const double w = lvl.widths[size_t(k)] + ExtraWidth(lvl, it, float(s));
     const double r0 = lvl.innerPx, pad = cfg.pillPad * s;
     if (r < r0 - pad || r > r0 + w + pad) return -1;
     return int(k);
@@ -2402,7 +2537,8 @@ static void OpenWheel(POINT pt) {
     if (FAILED(GetDpiForMonitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST),
                                 MDT_EFFECTIVE_DPI, &dpi, &dpiY)))
         dpi = g.owner ? GetDpiForWindow(g.owner) : 0;
-    g.scale = float(dpi ? dpi : 96) / 96.0f;
+    g.dpiScale = float(dpi ? dpi : 96) / 96.0f;
+    g.scale = g.dpiScale * cfg.textScale;
     g.forceRender = true;
     ApplyTheme();
     g.center = pt;
@@ -3017,6 +3153,9 @@ static void LoadConfig() {
     cfg.hasLabelColor = ParseColor(StrSetting(L"labelColor"), &cfg.userLabel);
     cfg.hasHighlight =
         ParseColor(StrSetting(L"highlightColor"), &cfg.userHighlight);
+    cfg.textScale =
+        float(std::clamp(Wh_GetIntSetting(L"textSize"), 9, 30)) / 15.0f;
+    cfg.icons = Wh_GetIntSetting(L"icons") != 0;
     const std::wstring shape = StrSetting(L"shape");
     cfg.shape = shape == L"list" ? 1 : shape == L"slide" ? 2 : 0;
     const std::wstring showLast = StrSetting(L"showLast");
@@ -3298,6 +3437,9 @@ static bool RunWheel(HMENU hMenu, UINT flags, int x, int y, HWND owner,
     result->cmd = g.resCmd;
     result->menu = g.resMenu;
     result->pos = g.resPos;
+    // Icon bitmaps are looked up by the items' icon data, which goes away
+    // with the menu model, so they go first.
+    ReleaseIconBitmaps();
     g.stack.clear();
     g_menu.clear();
     // On unload, let go of everything here, on the thread that was using it.
