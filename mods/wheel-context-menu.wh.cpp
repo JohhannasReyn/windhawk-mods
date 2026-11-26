@@ -2,7 +2,7 @@
 // @id              wheel-context-menu
 // @name            Wheel Context Menu
 // @description     Replaces classic context menus with a fading, rotating wheel you can spin, scroll, type into and rearrange
-// @version         0.1
+// @version         0.2
 // @author          Johhannas Reyn
 // @github          https://github.com/JohhannasReyn
 // @homepage        https://thegnosys.com
@@ -134,7 +134,7 @@ takes the menu, so use one at a time.
   $description: Half-height of the centre band, in tenths of a degree.
 - itemSpacing: 12
   $name: Item spacing
-  $description: Degrees between items on the inner ring.
+  $description: Degrees between items on the inner ring. In the sliding list, smaller values show more rows before they fade out.
 - wrap: false
   $name: Wrap long lists
 - fadeOutAfter: 60
@@ -145,7 +145,7 @@ takes the menu, so use one at a time.
   $description: Opacity of the label backgrounds at the centre of the arc, 0 to 100.
 - edgeOpacity: 45
   $name: Edge opacity
-  $description: Opacity half way toward the ends of the arc (1:30 and 4:30), 0 to 100.
+  $description: Opacity half way toward the ends of the arc (1:30 and 4:30), 0 to 100. In the sliding list, the same for rows half way to the top and bottom.
 - textColor: ""
   $name: Text color
   $description: Hex color such as #F2F2F2. Leave empty to follow the theme.
@@ -424,7 +424,9 @@ struct Wheel {
     double extTop = 0.0;     // straight shapes: how far the menu reaches
     double extBottom = 0.0;  // above and below the centre line, px
     float scale = 1.0f;
-    int size = 0;            // window is size x size px
+    int size = 0;            // drawing space is size x size px, cursor centred
+    int surfX0 = 0;          // the window shows columns surfX0..surfX0+surfW
+    int surfW = 0;           // of it (all of it for the wheel)
     float outerPx = 0.0f;    // current rim radius, px (fits this level)
     float tiltR = 0.0f;      // radius the dead band and tilt are measured on
     std::vector<float> bgRadii;
@@ -471,7 +473,8 @@ struct Wheel {
     HDC memDC = nullptr;
     HBITMAP dib = nullptr;
     HGDIOBJ oldBmp = nullptr;
-    int dibSize = 0;
+    int dibSize = 0;         // height of the surface
+    int dibW = 0;            // and its width
 
     // Direct2D / DirectWrite.
     ID2D1Factory* d2d = nullptr;
@@ -658,7 +661,7 @@ static void DiscardDeviceResources() {
 }
 
 static bool EnsureSurface() {
-    if (g.dib && g.dibSize == g.size) return true;
+    if (g.dib && g.dibSize == g.size && g.dibW == g.surfW) return true;
     if (!g.memDC) g.memDC = CreateCompatibleDC(nullptr);
     if (!g.memDC) return false;
     if (g.dib) {
@@ -668,7 +671,7 @@ static bool EnsureSurface() {
     }
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = g.size;
+    bi.bmiHeader.biWidth = g.surfW;
     bi.bmiHeader.biHeight = -g.size;  // top-down
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
@@ -678,6 +681,7 @@ static bool EnsureSurface() {
     if (!g.dib) return false;
     g.oldBmp = SelectObject(g.memDC, g.dib);
     g.dibSize = g.size;
+    g.dibW = g.surfW;
     return true;
 }
 
@@ -1009,11 +1013,32 @@ static float BubbleCentre(float c, float width) {
     return c - float(g.side) * (12 * g.scale + width * 0.5f);
 }
 
+// Which part of the drawing space the window needs. The wheel uses all of
+// it. A straight menu is a column beside the cursor, so it only needs a
+// strip: the rows on one side, and room for the typed-text and note boxes
+// on the other. That keeps a tall list from costing a surface as wide as
+// it is tall.
+static void UpdateSurface() {
+    g.surfX0 = 0;
+    g.surfW = g.size;
+    if (!Straight()) return;
+    const float c = g.size * 0.5f, s = g.scale;
+    const float rows = g.outerPx + 120 * s;  // the columns, and a dragged label
+    const float boxes = 440 * s;             // typed text, the last-choice note
+    const float left = g.side > 0 ? c - boxes : c - rows;
+    const float right = g.side > 0 ? c + rows : c + boxes;
+    const int a = std::clamp(int(std::floor(left)), 0, g.size);
+    const int b = std::clamp(int(std::ceil(right)), 0, g.size);
+    g.surfX0 = a;
+    g.surfW = std::max(1, b - a);
+}
+
 static void Render() {
     bool stale = g.stack.back().rimPx <= 0.0f;
     for (const Level& l : g.stack)
         if (l.widths.size() != l.items.size()) stale = true;
     if (stale) LayoutLevel();
+    UpdateSurface();
     if (!EnsureResources()) return;
 
     const float c = g.size * 0.5f;
@@ -1026,12 +1051,22 @@ static void Render() {
     const float chev = 18 * s;
     const D2D1_MATRIX_3X2_F identity = Identity();
 
-    RECT rc = {0, 0, g.size, g.size};
+    // Everything below is drawn in the size x size space with the cursor at
+    // its centre. The surface may be a narrower strip of that space, so
+    // every transform is shifted across by where the strip starts.
+    const float x0 = float(g.surfX0);
+    auto setT = [&](const D2D1_MATRIX_3X2_F& m) {
+        D2D1_MATRIX_3X2_F t = m;
+        t._31 -= x0;
+        g.rt->SetTransform(&t);
+    };
+
+    RECT rc = {0, 0, g.surfW, g.size};
     g.rt->BindDC(g.memDC, &rc);
     g.rt->BeginDraw();
     const D2D1_COLOR_F clear = Color(0, 0.0f);
     g.rt->Clear(&clear);
-    g.rt->SetTransform(&identity);
+    setT(identity);
 
     const int shape = cfg.shape;  // 0 wheel, 1 list, 2 sliding list
     const float rowH = RowHeight();
@@ -1102,7 +1137,7 @@ static void Render() {
         // The list is a solid box with the rows inside it.
         if (shape == 1) {
             const int rows = n + (dragging ? 1 : 0);
-            g.rt->SetTransform(&identity);
+            setT(identity);
             D2D1_ROUNDED_RECT panel;
             panel.rect = SpanRect(c, colL, colR, 0);
             panel.rect.top = c + float(0.0 - ref) * rowH - rowH * 0.5f - 4 * s;
@@ -1133,7 +1168,7 @@ static void Render() {
                 const D2D1_MATRIX_3X2_F m = slotAt(pos - 0.5, &ta);
                 ta *= dim;
                 if (ta > 0.01f) {
-                    g.rt->SetTransform(&m);
+                    setT(m);
                     D2D1_POINT_2F a, b;
                     a.y = b.y = c;
                     if (shape == 0) {
@@ -1159,7 +1194,7 @@ static void Render() {
             const D2D1_MATRIX_3X2_F m = slotAt(pos, &a);
             a *= dim;
             if (a <= 0.01f) return;
-            g.rt->SetTransform(&m);
+            setT(m);
             const bool hasSub = !it.sub.empty();
             const float w = widths[size_t(idx)];
             const float chk = it.radio ? chev : 0;  // check-mark column
@@ -1248,7 +1283,7 @@ static void Render() {
             float a = 0.0f;
             const D2D1_MATRIX_3X2_F m = slotAt(g.gapPos, &a);
             if (a > 0.01f) {
-                g.rt->SetTransform(&m);
+                setT(m);
                 D2D1_ROUNDED_RECT rr;
                 rr.rect = shape == 1
                               ? SpanRect(c, colL + 4 * s, colR - 4 * s,
@@ -1278,7 +1313,7 @@ static void Render() {
 
     if (g.dragging) {
         // The carried item rides on the cursor.
-        g.rt->SetTransform(&identity);
+        setT(identity);
         const float px = float(g.lastCursor.x - g.center.x) + c;
         const float py = float(g.lastCursor.y - g.center.y) + c;
         D2D1_ROUNDED_RECT rr;
@@ -1304,7 +1339,7 @@ static void Render() {
     // The note of the last choice, greyed, in the middle of the wheel just
     // below the centre line. Top level only.
     if (cfg.lastNote == 3 && g.stack.size() == 1 && !g.lastNote.empty()) {
-        g.rt->SetTransform(&identity);
+        setT(identity);
         const float maxW = cfg.hubRadius * s * 1.7f;
         float tw = maxW;
         IDWriteTextLayout* layout = nullptr;
@@ -1338,7 +1373,7 @@ static void Render() {
 
     // What has been typed so far, shown just above the cursor.
     if (!g.typed.empty()) {
-        g.rt->SetTransform(&identity);
+        setT(identity);
         float tw = 40 * s;
         IDWriteTextLayout* layout = nullptr;
         if (SUCCEEDED(g.dw->CreateTextLayout(
@@ -1372,7 +1407,7 @@ static void Render() {
                        DWRITE_MEASURING_MODE_NATURAL);
     }
 
-    g.rt->SetTransform(&identity);
+    setT(identity);
     const HRESULT hr = g.rt->EndDraw(nullptr, nullptr);
     if (hr == HRESULT(D2DERR_RECREATE_TARGET)) {
         DiscardDeviceResources();
@@ -1380,8 +1415,9 @@ static void Render() {
         return;
     }
 
-    POINT dst = {g.center.x - g.size / 2, g.center.y - g.size / 2};
-    SIZE sz = {g.size, g.size};
+    POINT dst = {g.center.x - g.size / 2 + g.surfX0,
+                 g.center.y - g.size / 2};
+    SIZE sz = {g.surfW, g.size};
     POINT src = {0, 0};
     BLENDFUNCTION bf = {};
     bf.BlendOp = AC_SRC_OVER;
@@ -1573,7 +1609,7 @@ static Level BuildRootLevel() {
             if (cfg.lastNote == 1) {
                 info.hoisted = true;  // sits with any recent choices on top
                 lvl.items.insert(lvl.items.begin(), info);
-                if (lvl.hoisted > 0) lvl.hoisted++;
+                lvl.hoisted++;  // also gives it a separator underneath
             } else {
                 info.groupStart = true;
                 lvl.items.push_back(info);
@@ -1656,7 +1692,8 @@ struct Choice {
 };
 
 struct Setting {
-    const wchar_t* name;
+    const wchar_t* name;  // shown in the menu; free to change
+    const wchar_t* key;   // where a choice is stored; never changes
     float (*get)();
     void (*set)(float);
     std::vector<Choice> choices;
@@ -1664,75 +1701,75 @@ struct Setting {
 
 static const std::vector<Setting>& Settings() {
     static const std::vector<Setting> v = {
-        {L"Shape",
+        {L"Shape", L"opt_Shape",
          [] { return float(cfg.shape); },
          [](float x) { cfg.shape = int(x); },
          {{L"Wheel", 0}, {L"List", 1}, {L"Sliding list", 2}}},
-        {L"Opens toward",
+        {L"Opens toward", L"opt_Openstoward",
          [] { return cfg.preferLeft ? 1.0f : 0.0f; },
          [](float x) { cfg.preferLeft = x > 0.5f; },
          {{L"Right", 0}, {L"Left", 1}}},
-        {L"Opens on",
+        {L"Opens on", L"opt_Openson",
          [] { return float(cfg.preselect); },
          [](float x) { cfg.preselect = int(x); },
          {{L"First item", 0}, {L"Last choice", 1}, {L"Last, or Paste", 2}}},
-        {L"Recent on top",
+        {L"Recent on top", L"opt_Recentontop",
          [] { return float(cfg.mruCount); },
          [](float x) { cfg.mruCount = int(x); },
          {{L"Off", 0}, {L"Last 3", 3}, {L"Last 5", 5}}},
-        {L"Tilt to spin",
+        {L"Tilt to spin", L"opt_Tilttospin",
          [] { return cfg.tilt ? 1.0f : 0.0f; },
          [](float x) { cfg.tilt = x > 0.5f; },
          {{L"On", 1}, {L"Off", 0}}},
-        {L"Tilt speed",
+        {L"Tilt speed", L"opt_Tiltspeed",
          [] { return cfg.maxSpeed; },
          [](float x) { cfg.maxSpeed = x; },
          {{L"Slow", 10}, {L"Normal", 18}, {L"Fast", 26}, {L"Very fast", 36}}},
-        {L"Tilt response",
+        {L"Tilt response", L"opt_Tiltresponse",
          [] { return cfg.expo; },
          [](float x) { cfg.expo = x; },
          {{L"Linear", 1.0f}, {L"Gentle", 1.4f}, {L"Curved", 2.0f},
           {L"Steep", 3.0f}}},
-        {L"Dead band",
+        {L"Dead band", L"opt_Deadband",
          [] { return cfg.deadBandDeg; },
          [](float x) { cfg.deadBandDeg = x; },
          {{L"Narrow", 5.0f}, {L"Normal", 7.5f}, {L"Wide", 11.0f}}},
-        {L"Item spacing",
+        {L"Item spacing", L"opt_Itemspacing",
          [] { return cfg.stepDeg; },
          [](float x) { cfg.stepDeg = x; },
          {{L"Tight", 10}, {L"Normal", 12}, {L"Loose", 15}}},
-        {L"Wrap long lists",
+        {L"Wrap long lists", L"opt_Wraplonglists",
          [] { return cfg.wrap ? 1.0f : 0.0f; },
          [](float x) { cfg.wrap = x > 0.5f; },
          {{L"Off", 0}, {L"On", 1}}},
-        {L"Guide lines",
+        {L"Guide lines", L"opt_Guidelines",
          [] { return cfg.guides ? 1.0f : 0.0f; },
          [](float x) { cfg.guides = x > 0.5f; },
          {{L"Off", 0}, {L"On", 1}}},
-        {L"Fade out after",
+        {L"Fade out after", L"opt_Fadeoutafter",
          [] { return cfg.idleTimeoutSec; },
          [](float x) { cfg.idleTimeoutSec = x; },
          {{L"10 seconds", 10}, {L"30 seconds", 30}, {L"1 minute", 60},
           {L"2 minutes", 120}}},
-        {L"Theme",
+        {L"Theme", L"opt_Theme",
          [] { return float(cfg.theme); },
          [](float x) { cfg.theme = int(x); },
          {{L"Dark", 0}, {L"Light", 1}, {L"Match Windows", 2}}},
-        {L"Outline",
+        {L"Outline", L"opt_Outline",
          [] { return cfg.accentOutline ? 1.0f : 0.0f; },
          [](float x) { cfg.accentOutline = x > 0.5f; },
          {{L"Plain", 0}, {L"Windows accent", 1}}},
-        {L"Submenus",
+        {L"Submenus", L"opt_Submenus",
          [] { return float(cfg.menuMode); },
          [](float x) { cfg.menuMode = int(x); },
          {{L"Replace the wheel", 0}, {L"Stack outward", 1},
           {L"Alternate", 2}}},
-        {L"Empty click",
+        {L"Empty click", L"opt_Emptyclick",
          [] { return float(cfg.emptyClick); },
          [](float x) { cfg.emptyClick = int(x); },
          {{L"Chooses", 0}, {L"Does nothing", 1}, {L"Closes the menu", 2},
           {L"Goes back", 3}}},
-        {L"Last choice note",
+        {L"Last choice note", L"opt_Lastchoicenote",
          [] { return float(cfg.lastNote); },
          [](float x) { cfg.lastNote = int(x); },
          {{L"Off", 0}, {L"Top of the list", 1}, {L"Bottom of the list", 2},
@@ -1741,12 +1778,8 @@ static const std::vector<Setting>& Settings() {
     return v;
 }
 
-// Storage key for a choice made in "Menu options".
-static std::wstring OverrideKey(const Setting& st) {
-    std::wstring key = L"opt_";
-    for (const wchar_t* p = st.name; *p; p++)
-        if (std::iswalnum(*p)) key += *p;
-    return key;
+static bool IsSetting(const Setting& st, const wchar_t* key) {
+    return std::wcscmp(st.key, key) == 0;
 }
 
 // The whole options subtree, reflecting cfg as it stands right now.
@@ -1798,7 +1831,7 @@ static void ApplyOption(int id) {
     const size_t c = size_t((id - ID_OPT_BASE) % 32);
     if (k >= all.size() || c >= all[k].choices.size()) return;
     all[k].set(all[k].choices[c].value);
-    if (std::wcscmp(all[k].name, L"Opens toward") == 0)
+    if (IsSetting(all[k], L"opt_Openstoward"))
         g.side = cfg.preferLeft ? -1 : 1;  // show a side change now
     g.forceRender = true;
     ApplyTheme();
@@ -1823,9 +1856,11 @@ static void ApplyOption(int id) {
         choices.widths.clear();
         LayoutLevel();
     }
-    ResetListViews();  // in case the shape or the submenu mode changed
+    // Only a new shape or submenu mode moves the lists.
+    if (IsSetting(all[k], L"opt_Shape") || IsSetting(all[k], L"opt_Submenus"))
+        ResetListViews();
     // Remember it; see LoadConfig for how this meets the mod's settings.
-    Wh_SetIntValue(OverrideKey(all[k]).c_str(),
+    Wh_SetIntValue(all[k].key,
                    int(std::lround(all[k].choices[c].value * 100.0f)));
 }
 
@@ -2015,15 +2050,14 @@ static void Touch() {
     if (g.closing && g.closeCancelable) g.closing = false;
 }
 
-// Fractional list position under the cursor's angle.
-static void UpdateExtent();
-
+// Fractional list position under the cursor: by its angle in the wheel, by
+// its height in a straight menu.
 static double CursorSlot(POINT pt) {
     const double dx = double(g.side) * (pt.x - g.center.x);
     const double dy = double(pt.y - g.center.y);
+    if (Straight()) return TopRef() + dy / RowHeight();
     const double phi =
         std::clamp(std::atan2(dy, std::max(dx, 1.0)) * 180.0 / kPi, -88.0, 88.0);
-    if (Straight()) return TopRef() + dy / RowHeight();
     return g.rot + phi / TopStep();
 }
 
@@ -2204,6 +2238,27 @@ static void ClampPosition() {
     }
 }
 
+// The last-choice note is not somewhere to stop.
+static bool IsNote(int idx) {
+    const std::vector<Item>& items = g.stack.back().items;
+    return idx >= 0 && idx < int(items.size()) &&
+           items[size_t(idx)].id == ID_INFO;
+}
+
+// After a step in direction `dir`: if it landed on the note, carry on past
+// it, or stay where we were if the note is the end of the list.
+static void AvoidNote(int dir) {
+    const int n = ItemCount();
+    if (n < 2 || !IsNote(Mod(std::llround(g.target), n))) return;
+    const double landed = g.target;
+    g.target = landed + dir;
+    ClampPosition();
+    if (IsNote(Mod(std::llround(g.target), n))) {
+        g.target = landed - dir;
+        ClampPosition();
+    }
+}
+
 static void StepBy(int n) {
     if (!g.open) return;
     Touch();
@@ -2212,6 +2267,7 @@ static void StepBy(int n) {
     GetCursorPos(&g.holdPos);
     g.target = std::round(g.target) + n;
     ClampPosition();
+    AvoidNote(n > 0 ? 1 : -1);
 }
 
 // Moves the highlight straight to an item; like StepBy, this parks tilt.
@@ -2232,13 +2288,18 @@ static int CurrentIndex() {
 static void KeyStep(int dir) {
     if (!g.open || g.dragging) return;
     const int n = ItemCount();
-    JumpTo(Mod(CurrentIndex() + dir, n));
+    int i = Mod(CurrentIndex() + dir, n);
+    if (IsNote(i) && n > 1) i = Mod(i + dir, n);
+    JumpTo(i);
 }
 
 // Left / Right (and Home / End): first or last item of the list.
 static void KeyJumpEnd(bool last) {
     if (!g.open) return;
-    JumpTo(last ? ItemCount() - 1 : 0);
+    const int n = ItemCount();
+    int i = last ? n - 1 : 0;
+    if (IsNote(i) && n > 1) i += last ? -1 : 1;
+    JumpTo(i);
 }
 
 static bool MatchAt(const std::wstring& text, size_t at,
@@ -2970,7 +3031,7 @@ static void LoadConfig() {
 
     const bool drop = g_dropOverrides.exchange(false);
     for (const Setting& st : Settings()) {
-        const std::wstring key = OverrideKey(st);
+        const std::wstring key = st.key;
         if (drop) {
             Wh_DeleteValue(key.c_str());
             continue;
@@ -3015,6 +3076,7 @@ static void ReleaseGraphics() {
         DeleteObject(g.dib);
         g.dib = nullptr;
         g.dibSize = 0;
+        g.dibW = 0;
     }
     if (g.memDC) {
         DeleteDC(g.memDC);
@@ -3248,7 +3310,8 @@ static bool ShouldTake(HMENU hMenu, HWND hWnd) {
 
 // Turns the wheel's outcome into what TrackPopupMenu would have returned and
 // sent. Returns false when the real menu should be shown instead.
-static bool Deliver(const WheelResult& r, UINT flags, HWND hWnd, BOOL* ret) {
+static bool Deliver(const WheelResult& r, HMENU tracked, UINT flags, HWND hWnd,
+                    BOOL* ret) {
     if (r.kind == R_NATIVE) return false;
     if (r.kind == R_COMMAND) {
         if (flags & TPM_RETURNCMD) {
@@ -3259,7 +3322,9 @@ static bool Deliver(const WheelResult& r, UINT flags, HWND hWnd, BOOL* ret) {
             MENUINFO mi = {};
             mi.cbSize = sizeof(mi);
             mi.fMask = MIM_STYLE;
-            if (GetMenuInfo(r.menu, &mi) && (mi.dwStyle & MNS_NOTIFYBYPOS))
+            // A header style: Windows reads it from the menu passed to
+            // TrackPopupMenu, not from the submenu the item sits in.
+            if (GetMenuInfo(tracked, &mi) && (mi.dwStyle & MNS_NOTIFYBYPOS))
                 PostMessageW(hWnd, WM_MENUCOMMAND, r.pos, LPARAM(r.menu));
             else
                 PostMessageW(hWnd, WM_COMMAND, MAKEWPARAM(r.cmd, 0), 0);
@@ -3278,7 +3343,7 @@ BOOL WINAPI TrackPopupMenuEx_Hook(HMENU hMenu, UINT uFlags, int x, int y,
         WheelResult r;
         BOOL ret = FALSE;
         if (RunWheel(hMenu, uFlags, x, y, hWnd, &r) &&
-            Deliver(r, uFlags, hWnd, &ret))
+            Deliver(r, hMenu, uFlags, hWnd, &ret))
             return ret;
     }
     t_passThrough++;
@@ -3295,7 +3360,7 @@ BOOL WINAPI TrackPopupMenu_Hook(HMENU hMenu, UINT uFlags, int x, int y,
         WheelResult r;
         BOOL ret = FALSE;
         if (RunWheel(hMenu, uFlags, x, y, hWnd, &r) &&
-            Deliver(r, uFlags, hWnd, &ret))
+            Deliver(r, hMenu, uFlags, hWnd, &ret))
             return ret;
     }
     t_passThrough++;
